@@ -55,8 +55,8 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
         _globalSem = new SemaphoreSlim(opt.GLOBAL_UPSTREAM_LIMIT);
         _janitorTask = Task.Run(CleanupLoopAsync);
 
-        _playlistTtl = opt.PlaylistTtl > TimeSpan.Zero ? opt.PlaylistTtl : DefaultPlaylistTtl;
-        _segmentTtl = opt.SegmentTtl > TimeSpan.Zero ? opt.SegmentTtl : DefaultSegmentTtl;
+        _playlistTtl = opt.PlaylistTtl >= TimeSpan.Zero ? opt.PlaylistTtl : DefaultPlaylistTtl;
+        _segmentTtl = opt.SegmentTtl >= TimeSpan.Zero ? opt.SegmentTtl : DefaultSegmentTtl;
         _sidTtl = opt.SID_TTL_MIN > 0
             ? TimeSpan.FromMinutes(opt.SID_TTL_MIN)
             : DefaultSidTtl;

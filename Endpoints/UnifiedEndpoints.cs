@@ -308,11 +308,36 @@ public sealed class UnifiedEndpoints : ControllerBase
             using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if (!resp.IsSuccessStatusCode) return;
 
-            var data = await resp.Content.ReadAsByteArrayAsync(cts.Token);
-            if (data.Length == 0 || data.Length > MaxSegmentSizeBytes)
-                return;
+            await using var upstream = await resp.Content.ReadAsStreamAsync(cts.Token);
+            using var ms = new MemoryStream();
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                int total = 0;
+                while (true)
+                {
+                    var remainingWithGuard = MaxSegmentSizeBytes - total + 1;
+                    var toRead = Math.Min(buffer.Length, Math.Max(1, remainingWithGuard));
+                    int read = await upstream.ReadAsync(buffer.AsMemory(0, toRead), cts.Token);
+                    if (read == 0)
+                        break;
 
-            _cache.SetSegment(key, data);
+                    total += read;
+                    if (total > MaxSegmentSizeBytes)
+                        return;
+
+                    ms.Write(buffer, 0, read);
+                }
+
+                if (total == 0)
+                    return;
+
+                _cache.SetSegment(key, ms.ToArray());
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
         finally
         {
