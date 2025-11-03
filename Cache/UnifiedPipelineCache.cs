@@ -12,16 +12,20 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
     private readonly ProxyOptions _opt;
 
     private const long MaxCacheSize = 20L * 1024L * 1024L * 1024L;
-    private static readonly TimeSpan PlaylistTtl = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan SegmentTtl = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan SidTtl = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan DefaultPlaylistTtl = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan DefaultSegmentTtl = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan DefaultSidTtl = TimeSpan.FromMinutes(15);
 
     private readonly ConcurrentDictionary<string, SidEntry> _sessions = new();
     private readonly ConcurrentDictionary<string, Lazy<Task<byte[]>>> _inflightFetches = new();
     private readonly SemaphoreSlim _globalSem;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _janitorTask;
+    private readonly TimeSpan _playlistTtl;
+    private readonly TimeSpan _segmentTtl;
+    private readonly TimeSpan _sidTtl;
+    private readonly int _maxSegmentCacheItemBytes;
     private long _globalInUse;
     private long _playlistCount;
     private long _segmentCount;
@@ -50,6 +54,15 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
 
         _globalSem = new SemaphoreSlim(opt.GLOBAL_UPSTREAM_LIMIT);
         _janitorTask = Task.Run(CleanupLoopAsync);
+
+        _playlistTtl = opt.PlaylistTtl >= TimeSpan.Zero ? opt.PlaylistTtl : DefaultPlaylistTtl;
+        _segmentTtl = opt.SegmentTtl >= TimeSpan.Zero ? opt.SegmentTtl : DefaultSegmentTtl;
+        _sidTtl = opt.SID_TTL_MIN > 0
+            ? TimeSpan.FromMinutes(opt.SID_TTL_MIN)
+            : DefaultSidTtl;
+        _maxSegmentCacheItemBytes = opt.SEG_CACHE_MAX_ITEM_BYTES <= 0
+            ? int.MaxValue
+            : Math.Max(opt.SEG_CACHE_MAX_ITEM_BYTES, 64 * 1024);
     }
 
     // Shared, de-duplicated fetch logic
@@ -64,12 +77,13 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
                 try
                 {
                     var data = await fetch().ConfigureAwait(false);
-                    if (data.Length > 0)
+                    var expiration = ttl ?? GetDefaultTtlForKey(k);
+                    if (data.Length > 0 && ShouldCacheItem(k, data.Length) && expiration > TimeSpan.Zero)
                     {
                         _cache.Set(k, data,
                             new MemoryCacheEntryOptions()
                                 .SetSize(data.Length)
-                                .SetSlidingExpiration(ttl ?? SegmentTtl));
+                                .SetSlidingExpiration(expiration));
                         if (k.StartsWith("pl:", StringComparison.OrdinalIgnoreCase))
                             Interlocked.Increment(ref _playlistCount);
                         else if (k.StartsWith("seg:", StringComparison.OrdinalIgnoreCase))
@@ -95,9 +109,12 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
 
     public void SetPlaylist(string key, byte[] data)
     {
+        if (_playlistTtl <= TimeSpan.Zero)
+            return;
+
         _cache.Set(key, data, new MemoryCacheEntryOptions()
             .SetSize(data.Length)
-            .SetSlidingExpiration(PlaylistTtl));
+            .SetSlidingExpiration(_playlistTtl));
         Interlocked.Increment(ref _playlistCount);
     }
 
@@ -110,7 +127,13 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
 
     public void SetSegment(string key, byte[] data, bool extendTtl = false)
     {
-        var ttl = extendTtl ? TimeSpan.FromHours(1) : SegmentTtl;
+        if (!ShouldCacheItem(key, data.Length))
+            return;
+
+        var ttl = extendTtl ? TimeSpan.FromHours(1) : _segmentTtl;
+        if (ttl <= TimeSpan.Zero)
+            return;
+
         _cache.Set(key, data, new MemoryCacheEntryOptions()
             .SetSize(data.Length)
             .SetSlidingExpiration(ttl));
@@ -208,7 +231,7 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
                 int removed = 0;
                 foreach (var kv in _sessions)
                 {
-                    if ((DateTime.UtcNow - kv.Value.Created) > SidTtl &&
+                    if ((DateTime.UtcNow - kv.Value.Created) > _sidTtl &&
                         _sessions.TryRemove(kv.Key, out var e))
                     {
                         e.Semaphore.Dispose();
@@ -220,6 +243,29 @@ public sealed class UnifiedPipelineCache : IDisposable, IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+    private bool ShouldCacheItem(string key, int length)
+    {
+        if (key.StartsWith("pl:", StringComparison.OrdinalIgnoreCase))
+            return _playlistTtl > TimeSpan.Zero;
+
+        if (!key.StartsWith("seg:", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (_segmentTtl <= TimeSpan.Zero)
+            return false;
+
+        return length <= _maxSegmentCacheItemBytes;
+    }
+
+    private TimeSpan GetDefaultTtlForKey(string key)
+    {
+        if (key.StartsWith("pl:", StringComparison.OrdinalIgnoreCase))
+            return _playlistTtl;
+        if (key.StartsWith("seg:", StringComparison.OrdinalIgnoreCase))
+            return _segmentTtl;
+        return _segmentTtl;
     }
 
     public void Dispose()

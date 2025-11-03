@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Net.Http;
 using System.Text;
@@ -23,7 +24,8 @@ namespace VoeProxy.Endpoints;
 [ResponseCache(NoStore = true, Duration = 0)]
 public sealed class UnifiedEndpoints : ControllerBase
 {
-    private readonly HttpClient _http;
+    private readonly HttpClient _streamHttp;
+    private readonly HttpClient _prefetchHttp;
     private readonly ProxyOptions _opt;
     private readonly UnifiedPipelineCache _cache;
     private readonly Base64Url _b64;
@@ -36,12 +38,11 @@ public sealed class UnifiedEndpoints : ControllerBase
     private static readonly Counter<long> BytesStreamed = Meter.CreateCounter<long>("voeproxy_streamed_bytes");
 
     private static readonly ConcurrentDictionary<string, byte> _prefetchSet = new();
-    private const int MaxSegmentSizeBytes = 25 * 1024 * 1024;
-    private const int BufferSize = 64 * 1024;
+    private readonly int _maxSegmentSizeBytes;
     private static readonly DateTime _start = DateTime.UtcNow;
 
     public UnifiedEndpoints(
-        HttpClient http,
+        IHttpClientFactory httpFactory,
         ProxyOptions opt,
         UnifiedPipelineCache cache,
         Base64Url b64,
@@ -49,13 +50,17 @@ public sealed class UnifiedEndpoints : ControllerBase
         ClientClassifier classifier,
         ILogger<UnifiedEndpoints> log)
     {
-        _http = http;
         _opt = opt;
         _cache = cache;
         _b64 = b64;
         _extractor = extractor;
         _classifier = classifier;
         _log = log;
+        _streamHttp = httpFactory.CreateClient("stream");
+        _prefetchHttp = httpFactory.CreateClient("prefetch");
+        _maxSegmentSizeBytes = opt.MAX_SEGMENT_SIZE_MB <= 0
+            ? int.MaxValue
+            : (int)Math.Min(int.MaxValue, (long)opt.MAX_SEGMENT_SIZE_MB * 1024L * 1024L);
     }
 
     // ======================================================================
@@ -217,13 +222,13 @@ public sealed class UnifiedEndpoints : ControllerBase
             async () =>
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, upstreamUrl);
-                req.Headers.TryAddWithoutValidation("User-Agent", "VoeProxy/1.0");
+                req.Headers.TryAddWithoutValidation("User-Agent", _opt.USER_AGENT);
                 if (!string.IsNullOrEmpty(entry.Value.Cookie))
                     req.Headers.TryAddWithoutValidation("Cookie", entry.Value.Cookie);
                 if (!string.IsNullOrEmpty(entry.Value.Referer))
                     req.Headers.Referrer = new Uri(entry.Value.Referer);
 
-                using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                using var resp = await _streamHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
                 if (!resp.IsSuccessStatusCode)
                 {
                     _log.LogWarning("[UPSTREAM-FAIL] {sid} {url} :: {code}", sid, upstreamUrl, resp.StatusCode);
@@ -231,9 +236,70 @@ public sealed class UnifiedEndpoints : ControllerBase
                     return Array.Empty<byte>();
                 }
 
-                return await resp.Content.ReadAsByteArrayAsync(ct);
+                if (resp.Content.Headers.ContentLength is long len && len > _maxSegmentSizeBytes)
+                {
+                    _log.LogWarning(
+                        "[SEGMENT-TOO-LARGE-HEADERS] {sid} {url} {sizeMb:F2}MB>{limitMb}MB",
+                        sid,
+                        upstreamUrl,
+                        len / 1024.0 / 1024.0,
+                        _maxSegmentSizeBytes / 1024.0 / 1024.0);
+                    ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                    ctx.Response.Headers["X-Error"] = "segment-too-large";
+                    return Array.Empty<byte>();
+                }
+
+                await using var upstream = await resp.Content.ReadAsStreamAsync(ct);
+                using var ms = new MemoryStream(capacity: Math.Min(_maxSegmentSizeBytes, 64 * 1024));
+                var buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+                try
+                {
+                    int total = 0;
+                    while (true)
+                    {
+                        var remaining = _maxSegmentSizeBytes == int.MaxValue
+                            ? buffer.Length
+                            : Math.Max(0, Math.Min(buffer.Length, _maxSegmentSizeBytes - total));
+                        if (remaining == 0)
+                        {
+                            _log.LogWarning(
+                                "[SEGMENT-TOO-LARGE] {sid} {url} exceeded {limitMb}MB",
+                                sid,
+                                upstreamUrl,
+                                _maxSegmentSizeBytes / 1024.0 / 1024.0);
+                            ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                            ctx.Response.Headers["X-Error"] = "segment-too-large";
+                            return Array.Empty<byte>();
+                        }
+
+                        int read = await upstream.ReadAsync(buffer.AsMemory(0, remaining), ct);
+                        if (read == 0)
+                            break;
+
+                        total += read;
+                        ms.Write(buffer, 0, read);
+
+                        if (_maxSegmentSizeBytes != int.MaxValue && total > _maxSegmentSizeBytes)
+                        {
+                            _log.LogWarning(
+                                "[SEGMENT-TOO-LARGE] {sid} {url} exceeded {limitMb}MB",
+                                sid,
+                                upstreamUrl,
+                                _maxSegmentSizeBytes / 1024.0 / 1024.0);
+                            ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                            ctx.Response.Headers["X-Error"] = "segment-too-large";
+                            return Array.Empty<byte>();
+                        }
+                    }
+
+                    return ms.ToArray();
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
             },
-            TimeSpan.FromMinutes(5)
+            _opt.SegmentTtl
         );
 
         if (segmentData.Length == 0)
@@ -248,6 +314,7 @@ public sealed class UnifiedEndpoints : ControllerBase
 
         ctx.Response.Headers["Accept-Ranges"] = "bytes";
         ctx.Response.ContentType = GuessContentType(extHint);
+        var writer = ctx.Response.BodyWriter;
 
         if (isRange)
         {
@@ -264,11 +331,7 @@ public sealed class UnifiedEndpoints : ControllerBase
             ctx.Response.ContentLength = len;
             await ctx.Response.StartAsync(ct);
 
-            // Write slice
-            int iFrom = (int)from;
-            int iLen = (int)len;
-            await ctx.Response.Body.WriteAsync(segmentData, iFrom, iLen, ct);
-            await ctx.Response.Body.FlushAsync(ct);
+            await writer.WriteAsync(segmentData.AsMemory((int)from, (int)len), ct);
 
             BytesStreamed.Add(len);
             ctx.RecordSegment(len, timer);
@@ -280,8 +343,7 @@ public sealed class UnifiedEndpoints : ControllerBase
             ctx.Response.ContentLength = segmentData.LongLength;
             await ctx.Response.StartAsync(ct);
 
-            await ctx.Response.Body.WriteAsync(segmentData, ct);
-            await ctx.Response.Body.FlushAsync(ct);
+            await writer.WriteAsync(segmentData.AsMemory(), ct);
 
             BytesStreamed.Add(segmentData.LongLength);
             ctx.RecordSegment(segmentData.LongLength, timer);
@@ -304,29 +366,53 @@ public sealed class UnifiedEndpoints : ControllerBase
         {
             if (_cache.TryGetSegment(key, out _)) return;
 
-            var req = new HttpRequestMessage(HttpMethod.Get, nextUrl);
-            req.Headers.TryAddWithoutValidation("User-Agent", "VoeProxy/1.0");
+            using var req = new HttpRequestMessage(HttpMethod.Get, nextUrl);
+            req.Headers.TryAddWithoutValidation("User-Agent", _opt.USER_AGENT);
             if (!string.IsNullOrEmpty(cookie)) req.Headers.TryAddWithoutValidation("Cookie", cookie);
             if (!string.IsNullOrEmpty(referer)) req.Headers.Referrer = new Uri(referer);
 
-            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            using var resp = await _prefetchHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if (!resp.IsSuccessStatusCode) return;
 
-            await using var upstream = await resp.Content.ReadAsStreamAsync(cts.Token);
-            await using var ms = new MemoryStream(capacity: BufferSize * 2);
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+            if (resp.Content.Headers.ContentLength is long length && length > _maxSegmentSizeBytes)
+                return;
 
+            await using var upstream = await resp.Content.ReadAsStreamAsync(cts.Token);
+            using var ms = new MemoryStream();
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
             try
             {
-                int read;
-                while ((read = await upstream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token)) > 0)
+                int total = 0;
+                while (total < _maxSegmentSizeBytes)
                 {
-                    await ms.WriteAsync(buffer.AsMemory(0, read), cts.Token);
-                    if (ms.Length > MaxSegmentSizeBytes) return;
+                    var remaining = _maxSegmentSizeBytes == int.MaxValue
+                        ? buffer.Length
+                        : Math.Min(buffer.Length, _maxSegmentSizeBytes - total);
+                    if (remaining <= 0)
+                        break;
+                    var chunkSize = Math.Min(buffer.Length, remaining);
+                    int read = await upstream.ReadAsync(buffer.AsMemory(0, chunkSize), cts.Token);
+                    if (read == 0)
+                        break;
+
+                    ms.Write(buffer, 0, read);
+                    total += read;
+
+                    if (read < chunkSize)
+                        break;
                 }
 
-                if (ms.Length > 0)
-                    _cache.SetSegment(key, ms.ToArray());
+                if (total == 0)
+                    return;
+
+                if (_maxSegmentSizeBytes != int.MaxValue && total >= _maxSegmentSizeBytes)
+                {
+                    var extra = await upstream.ReadAsync(buffer.AsMemory(0, 1), cts.Token);
+                    if (extra > 0)
+                        return;
+                }
+
+                _cache.SetSegment(key, ms.ToArray());
             }
             finally
             {
@@ -365,14 +451,14 @@ public sealed class UnifiedEndpoints : ControllerBase
             Response.Headers["X-Client-Kind"] = clientLabel;
             if (sid is not null) Response.Headers["X-SID"] = sid;
             await Response.StartAsync(ct);
-            await Response.Body.WriteAsync(cached, ct);
+            await Response.BodyWriter.WriteAsync(cached.AsMemory(), ct);
             return;
         }
 
         using var req = new HttpRequestMessage(HttpMethod.Get, upstreamUrl);
         req.Headers.TryAddWithoutValidation("User-Agent", _opt.USER_AGENT);
 
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        using var resp = await _streamHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (!resp.IsSuccessStatusCode)
         {
             Response.StatusCode = (int)resp.StatusCode;
@@ -484,22 +570,37 @@ public sealed class UnifiedEndpoints : ControllerBase
     // ======================================================================
     private static bool TryParseSingleRange(string rangeHeader, long totalLength, out long from, out long to)
     {
-        from = 0; to = totalLength - 1;
-        if (string.IsNullOrEmpty(rangeHeader)) return false;
-        if (!rangeHeader.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase)) return false;
+        from = 0;
+        to = totalLength - 1;
+        if (totalLength <= 0 || string.IsNullOrEmpty(rangeHeader)) return false;
 
-        var v = rangeHeader.Substring(6);
-        var parts = v.Split('-', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length == 0) return false;
+        var span = rangeHeader.AsSpan();
+        if (!span.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+            return false;
 
-        if (!long.TryParse(parts[0], out var start)) return false;
-        long end = to;
-        if (parts.Length == 2 && long.TryParse(parts[1], out var parsedEnd)) end = parsedEnd;
+        span = span[6..];
+        var dashIndex = span.IndexOf('-');
+        if (dashIndex < 0)
+            return false;
+
+        var startSpan = span[..dashIndex].Trim();
+        if (startSpan.IsEmpty)
+            return false;
+
+        if (!long.TryParse(startSpan, NumberStyles.None, CultureInfo.InvariantCulture, out var start))
+            return false;
+
+        var endSpan = span[(dashIndex + 1)..].Trim();
+        var end = to;
+        if (!endSpan.IsEmpty && long.TryParse(endSpan, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedEnd))
+            end = parsedEnd;
 
         start = Math.Clamp(start, 0, totalLength - 1);
         end = Math.Clamp(end, start, totalLength - 1);
 
-        from = start; to = end; return true;
+        from = start;
+        to = end;
+        return true;
     }
 
     private static string GuessContentType(string? ext) => ext?.ToLowerInvariant() switch
