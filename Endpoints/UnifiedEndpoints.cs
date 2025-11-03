@@ -314,23 +314,30 @@ public sealed class UnifiedEndpoints : ControllerBase
             try
             {
                 int total = 0;
-                while (true)
+                while (total < MaxSegmentSizeBytes)
                 {
-                    var remainingWithGuard = MaxSegmentSizeBytes - total + 1;
-                    var toRead = Math.Min(buffer.Length, Math.Max(1, remainingWithGuard));
-                    int read = await upstream.ReadAsync(buffer.AsMemory(0, toRead), cts.Token);
+                    var remaining = MaxSegmentSizeBytes - total;
+                    var chunkSize = Math.Min(buffer.Length, remaining);
+                    int read = await upstream.ReadAsync(buffer.AsMemory(0, chunkSize), cts.Token);
                     if (read == 0)
                         break;
 
-                    total += read;
-                    if (total > MaxSegmentSizeBytes)
-                        return;
-
                     ms.Write(buffer, 0, read);
+                    total += read;
+
+                    if (read < chunkSize)
+                        break;
                 }
 
                 if (total == 0)
                     return;
+
+                if (total >= MaxSegmentSizeBytes)
+                {
+                    var extra = await upstream.ReadAsync(buffer.AsMemory(0, 1), cts.Token);
+                    if (extra > 0)
+                        return;
+                }
 
                 _cache.SetSegment(key, ms.ToArray());
             }
