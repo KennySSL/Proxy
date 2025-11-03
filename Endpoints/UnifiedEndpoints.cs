@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Net.Http;
 using System.Text;
@@ -37,7 +38,6 @@ public sealed class UnifiedEndpoints : ControllerBase
 
     private static readonly ConcurrentDictionary<string, byte> _prefetchSet = new();
     private const int MaxSegmentSizeBytes = 25 * 1024 * 1024;
-    private const int BufferSize = 64 * 1024;
     private static readonly DateTime _start = DateTime.UtcNow;
 
     public UnifiedEndpoints(
@@ -248,6 +248,7 @@ public sealed class UnifiedEndpoints : ControllerBase
 
         ctx.Response.Headers["Accept-Ranges"] = "bytes";
         ctx.Response.ContentType = GuessContentType(extHint);
+        var writer = ctx.Response.BodyWriter;
 
         if (isRange)
         {
@@ -264,11 +265,7 @@ public sealed class UnifiedEndpoints : ControllerBase
             ctx.Response.ContentLength = len;
             await ctx.Response.StartAsync(ct);
 
-            // Write slice
-            int iFrom = (int)from;
-            int iLen = (int)len;
-            await ctx.Response.Body.WriteAsync(segmentData, iFrom, iLen, ct);
-            await ctx.Response.Body.FlushAsync(ct);
+            await writer.WriteAsync(segmentData.AsMemory((int)from, (int)len), ct);
 
             BytesStreamed.Add(len);
             ctx.RecordSegment(len, timer);
@@ -280,8 +277,7 @@ public sealed class UnifiedEndpoints : ControllerBase
             ctx.Response.ContentLength = segmentData.LongLength;
             await ctx.Response.StartAsync(ct);
 
-            await ctx.Response.Body.WriteAsync(segmentData, ct);
-            await ctx.Response.Body.FlushAsync(ct);
+            await writer.WriteAsync(segmentData.AsMemory(), ct);
 
             BytesStreamed.Add(segmentData.LongLength);
             ctx.RecordSegment(segmentData.LongLength, timer);
@@ -304,7 +300,7 @@ public sealed class UnifiedEndpoints : ControllerBase
         {
             if (_cache.TryGetSegment(key, out _)) return;
 
-            var req = new HttpRequestMessage(HttpMethod.Get, nextUrl);
+            using var req = new HttpRequestMessage(HttpMethod.Get, nextUrl);
             req.Headers.TryAddWithoutValidation("User-Agent", "VoeProxy/1.0");
             if (!string.IsNullOrEmpty(cookie)) req.Headers.TryAddWithoutValidation("Cookie", cookie);
             if (!string.IsNullOrEmpty(referer)) req.Headers.Referrer = new Uri(referer);
@@ -312,26 +308,11 @@ public sealed class UnifiedEndpoints : ControllerBase
             using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
             if (!resp.IsSuccessStatusCode) return;
 
-            await using var upstream = await resp.Content.ReadAsStreamAsync(cts.Token);
-            await using var ms = new MemoryStream(capacity: BufferSize * 2);
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+            var data = await resp.Content.ReadAsByteArrayAsync(cts.Token);
+            if (data.Length == 0 || data.Length > MaxSegmentSizeBytes)
+                return;
 
-            try
-            {
-                int read;
-                while ((read = await upstream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token)) > 0)
-                {
-                    await ms.WriteAsync(buffer.AsMemory(0, read), cts.Token);
-                    if (ms.Length > MaxSegmentSizeBytes) return;
-                }
-
-                if (ms.Length > 0)
-                    _cache.SetSegment(key, ms.ToArray());
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
+            _cache.SetSegment(key, data);
         }
         finally
         {
@@ -365,7 +346,7 @@ public sealed class UnifiedEndpoints : ControllerBase
             Response.Headers["X-Client-Kind"] = clientLabel;
             if (sid is not null) Response.Headers["X-SID"] = sid;
             await Response.StartAsync(ct);
-            await Response.Body.WriteAsync(cached, ct);
+            await Response.BodyWriter.WriteAsync(cached.AsMemory(), ct);
             return;
         }
 
@@ -484,22 +465,37 @@ public sealed class UnifiedEndpoints : ControllerBase
     // ======================================================================
     private static bool TryParseSingleRange(string rangeHeader, long totalLength, out long from, out long to)
     {
-        from = 0; to = totalLength - 1;
-        if (string.IsNullOrEmpty(rangeHeader)) return false;
-        if (!rangeHeader.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase)) return false;
+        from = 0;
+        to = totalLength - 1;
+        if (totalLength <= 0 || string.IsNullOrEmpty(rangeHeader)) return false;
 
-        var v = rangeHeader.Substring(6);
-        var parts = v.Split('-', 2, StringSplitOptions.TrimEntries);
-        if (parts.Length == 0) return false;
+        var span = rangeHeader.AsSpan();
+        if (!span.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+            return false;
 
-        if (!long.TryParse(parts[0], out var start)) return false;
-        long end = to;
-        if (parts.Length == 2 && long.TryParse(parts[1], out var parsedEnd)) end = parsedEnd;
+        span = span[6..];
+        var dashIndex = span.IndexOf('-');
+        if (dashIndex < 0)
+            return false;
+
+        var startSpan = span[..dashIndex].Trim();
+        if (startSpan.IsEmpty)
+            return false;
+
+        if (!long.TryParse(startSpan, NumberStyles.None, CultureInfo.InvariantCulture, out var start))
+            return false;
+
+        var endSpan = span[(dashIndex + 1)..].Trim();
+        var end = to;
+        if (!endSpan.IsEmpty && long.TryParse(endSpan, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedEnd))
+            end = parsedEnd;
 
         start = Math.Clamp(start, 0, totalLength - 1);
         end = Math.Clamp(end, start, totalLength - 1);
 
-        from = start; to = end; return true;
+        from = start;
+        to = end;
+        return true;
     }
 
     private static string GuessContentType(string? ext) => ext?.ToLowerInvariant() switch
