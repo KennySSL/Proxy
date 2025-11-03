@@ -1,0 +1,9 @@
+﻿bin/
+obj/
+.vs/
+*.user
+*.suo
+.idea/
+*.log
+# keine Secrets commiten
+appsettings.*.Development.json
